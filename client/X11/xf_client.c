@@ -32,7 +32,10 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
-
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include "util/u_hash_table.h"
+#include "util/u_pointer.h"
 #ifdef WITH_XRENDER
 #include <X11/extensions/Xrender.h>
 #include <math.h>
@@ -306,6 +309,22 @@ static BOOL xf_desktop_resize(rdpContext* context)
 	return TRUE;
 }
 
+unsigned hash_func_u32(void* key)
+{
+	intptr_t ip = pointer_to_intptr(key);
+	return (unsigned)(ip & 0xffffffff);
+}
+
+int compare_func(void* key1, void* key2)
+{
+	if (key1 < key2)
+		return -1;
+	if (key1 > key2)
+		return 1;
+	else
+		return 0;
+}
+
 static BOOL xf_sw_end_paint(rdpContext* context)
 {
 	int i;
@@ -351,8 +370,71 @@ static BOOL xf_sw_end_paint(rdpContext* context)
 				y = cinvalid[i].y;
 				w = cinvalid[i].w;
 				h = cinvalid[i].h;
-				XPutImage(xfc->display, xfc->primary, xfc->gc, xfc->image, x, y, x, y, w, h);
-				xf_draw_screen(xfc, x, y, w, h);
+				static struct util_hash_table* virgl_shm_table = NULL;
+				char* fb = NULL;
+				if (virgl_shm_table == NULL)
+				{
+					virgl_shm_table = util_hash_table_create(hash_func_u32, compare_func, NULL);
+				}
+				if (virgl_shm_table == NULL)
+				{
+					return FALSE;
+				}
+
+				struct RDP_TRANS_RES_ID* frame_buffer = (struct RDP_TRANS_RES_ID*)xfc->image->data;
+				frame_buffer->fb_height &= 0x00ff;
+				frame_buffer->fb_height |= frame_buffer->fb_height_high << 8;
+				frame_buffer->res_id &= 0x00ffffff;
+				frame_buffer->res_id |= frame_buffer->res_id_high << 24;
+
+				fb = util_hash_table_get(virgl_shm_table, uintptr_to_pointer(frame_buffer->res_id));
+				if (fb == NULL)
+				{
+
+					uint32_t share_mem_size =
+						8 + frame_buffer->fb_width * frame_buffer->fb_height * 4;
+					int shm_id =
+						shmget(0xff000000 + frame_buffer->res_id, share_mem_size, 0644 | IPC_CREAT);
+					if (shm_id > 0)
+					{
+						void* shm = shmat(shm_id, 0, 0);
+						if (shm == (void*)-1)
+						{
+							shmctl(shm_id, IPC_RMID, 0);
+						}
+						else
+						{
+							enum pipe_error err;
+							err = util_hash_table_set(
+								virgl_shm_table, uintptr_to_pointer(frame_buffer->res_id), shm);
+							if (err != PIPE_OK)
+							{
+								shmdt(shm);
+								shmctl(shm_id, IPC_RMID, 0);
+							}
+							else
+							{
+								fb = (char*)shm;
+							}
+						}
+					}
+				}
+
+				if (fb != NULL)
+				{
+					uint32_t width = *(uint32_t*)fb;
+					uint32_t height = *(uint32_t*)(fb + 4);
+					if (width != frame_buffer->fb_width || height != frame_buffer->fb_height)
+						return FALSE;
+				}
+				else
+					return FALSE;
+				char* image_data_bak = xfc->image->data;
+				xfc->image->data = fb + 8;
+				XPutImage(xfc->display, xfc->primary, xfc->gc, xfc->image, x, y, x, y,
+						  frame_buffer->fb_width, frame_buffer->fb_height);
+				xf_draw_screen(xfc, x, y, frame_buffer->fb_width, frame_buffer->fb_height);
+				xfc->image->data = image_data_bak;
 			}
 
 			XFlush(xfc->display);
