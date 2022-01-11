@@ -46,6 +46,15 @@ extern "C"
 
 	FREERDP_API int RdpClientEntry(RDP_CLIENT_ENTRY_POINTS* pEntryPoints);
 
+	struct RDP_TRANS_RES_ID {
+		uint16_t fb_width;
+		uint16_t fb_height;
+		uint32_t res_id;
+		uint8_t fb_height_high;
+		uint8_t res_id_high;
+		uint8_t padding[2];
+	};
+
 #ifdef __cplusplus
 }
 #endif
